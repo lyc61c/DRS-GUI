@@ -10,13 +10,8 @@ The best region found by MCTS is passed to a base grounding model. This release 
 
 ## Requirements
 
-DRS-GUI currently assumes the following environment:
-
-- Linux and Python 3.10.
-- An NVIDIA GPU with a CUDA-enabled PyTorch installation. CPU-only inference is not supported by the current entry points.
-- Enough GPU memory to load one 7B grounding model together with OmniParser's detector and Florence-2 caption model. A GPU with at least 24 GB VRAM is recommended; actual usage depends on screenshot resolution and the selected model.
-- Approximately 45 GB of free disk space for both grounding models, OmniParser V2, INSTRUCTOR-large, and all three benchmarks. Downloading only one grounding model requires substantially less space.
-- Internet access for the first download, or complete local copies of every model listed below.
+- Python 3.10
+- NVIDIA GPU with CUDA
 
 Create the environment from the repository root:
 
@@ -187,10 +182,6 @@ The official v1 and v2 boxes are `[x, y, width, height]`; the loader converts th
 For custom preprocessed v1/v2 JSON in `[x1, y1, x2, y2]` format, add `"bbox_format": "xyxy"` to each record to prevent conversion. Missing IDs, image sizes, applications, platforms, and UI types are filled when possible.
 
 ## Run benchmark evaluation
-
-For each sample, DRS-GUI first parses the screenshot and searches for the highest-reward region. Only that selected crop is then sent to the base grounding model for coordinate prediction; MCTS itself does not invoke the base MLLM. The default search budget and depth match the paper: 8 simulations and a maximum depth of 3.
-
-The released planner intentionally retains the implementation defaults used by this codebase: Focus selects 10% of elements, Scatter selects 8%, UCT includes the `sqrt(2)` exploration factor, and the available actions are filtered by region area. The paper reports 15% for Focus and 10% for Scatter and presents the standard UCT expression. The three-term reward follows the paper with weights `0.4/0.4/0.2`; because the paper does not state the non-interactive weight or semantic temperature, this release fixes them to `0.5` and `0.1`, respectively.
 
 The examples below use Qwen2.5-VL and locally downloaded weights.
 

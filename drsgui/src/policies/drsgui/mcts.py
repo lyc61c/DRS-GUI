@@ -1,6 +1,7 @@
 """Monte Carlo Tree Search action planner for DRS-GUI."""
 
 import base64
+from dataclasses import asdict, dataclass
 import io
 import logging
 import math
@@ -28,6 +29,21 @@ def _encode_image(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+@dataclass(frozen=True)
+class RewardBreakdown:
+    """Individual terms of the region-quality reward."""
+
+    relevance: float
+    coverage: float
+    concentration: float
+    total: float
+    element_count: int
+    interactive_count: int
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 class MCTSNode:
     """A candidate image region in the perception search tree."""
 
@@ -41,10 +57,29 @@ class MCTSNode:
         self.leaf_reward: float | None = None
         self.parsed_elements: list[dict] | None = None
         self.semantic_elements: list[dict] | None = None
+        self.reward_components: RewardBreakdown | None = None
+        self.failed_actions: list[str] = []
+        self.action_from_parent = state.get("action_from_parent")
 
         x1, y1, x2, y2 = state["region_coords"]
         full_area = max(1.0, state["image_width"] * state["image_height"])
         self.area_ratio = box_area([x1, y1, x2, y2]) / full_area
+
+    @property
+    def depth(self) -> int:
+        return int(self.state["depth"])
+
+    @property
+    def mean_value(self) -> float:
+        return self.value / self.visits if self.visits else 0.0
+
+    @property
+    def region(self) -> list[float]:
+        return list(self.state["region_coords"])
+
+    @property
+    def action_path(self) -> list[str]:
+        return list(self.state.get("action_history", []))
 
 
 class MCTSQuestionSample(BaseQuestionSample):
@@ -66,6 +101,9 @@ class MCTSQuestionSample(BaseQuestionSample):
         self.domain_prefix = select_instruction(row)
         self.root: MCTSNode | None = None
         self._global_parsed = None
+        self.include_search_tree = getattr(args, "include_search_tree", False)
+        self.action_attempts = {action: 0 for action in self.actions}
+        self.action_successes = {action: 0 for action in self.actions}
 
     async def _parse_node(self, node: MCTSNode) -> list[dict]:
         if node.parsed_elements is None:
@@ -138,6 +176,7 @@ class MCTSQuestionSample(BaseQuestionSample):
             "depth": parent.state["depth"] + 1,
             "image": _encode_image(image),
             "action_history": parent.state["action_history"] + [action],
+            "action_from_parent": action,
             "text": parent.state["text"],
             "image_width": self.image_width,
             "image_height": self.image_height,
@@ -226,11 +265,73 @@ class MCTSQuestionSample(BaseQuestionSample):
         while node.untried_actions:
             action = random.choice(node.untried_actions)
             node.untried_actions.remove(action)
+            self.action_attempts[action] += 1
             child = await self.action_executors[action](node)
             if child is not None:
+                self.action_successes[action] += 1
                 node.children[action] = child
                 return child
+            node.failed_actions.append(action)
         return node
+
+    @staticmethod
+    def _reward_breakdown(
+        elements: list[dict], semantic_elements: list[dict]
+    ) -> RewardBreakdown:
+        if not semantic_elements:
+            return RewardBreakdown(
+                relevance=0.0,
+                coverage=0.0,
+                concentration=0.0,
+                total=0.0,
+                element_count=len(elements),
+                interactive_count=0,
+            )
+
+        scores = np.asarray(
+            [item["similarity"] for item in semantic_elements], dtype=float
+        )
+        interaction_weights = np.asarray(
+            [
+                1.0 if item.get("interactivity", False) else NON_INTERACTIVE_WEIGHT
+                for item in semantic_elements
+            ],
+            dtype=float,
+        )
+        relevance = float(
+            np.sum(interaction_weights * scores)
+            / (np.sum(interaction_weights) + 1e-10)
+        )
+
+        coverage = 0.0
+        for element in elements:
+            box = element.get("bbox")
+            if isinstance(box, (list, tuple)) and len(box) == 4:
+                coverage += box_area(list(box))
+
+        logits = scores / SEMANTIC_TEMPERATURE
+        probabilities = np.exp(logits - np.max(logits))
+        probabilities /= np.sum(probabilities) + 1e-10
+        if len(probabilities) == 1:
+            concentration = 1.0
+        else:
+            entropy = -np.sum(probabilities * np.log(probabilities + 1e-10))
+            concentration = float(
+                1.0 - entropy / np.log(len(probabilities) + 1e-10)
+            )
+
+        alpha, beta, gamma = REWARD_WEIGHTS
+        total = alpha * relevance + beta * coverage + gamma * concentration
+        return RewardBreakdown(
+            relevance=relevance,
+            coverage=coverage,
+            concentration=concentration,
+            total=float(total),
+            element_count=len(elements),
+            interactive_count=sum(
+                bool(item.get("interactivity", False)) for item in semantic_elements
+            ),
+        )
 
     async def simulation(self, node: MCTSNode) -> float:
         """Compute the three-term region quality reward from the paper."""
@@ -243,37 +344,8 @@ class MCTSQuestionSample(BaseQuestionSample):
             topk=len(elements),
         )
         node.semantic_elements = semantic_elements
-        if not semantic_elements:
-            return 0.0
-
-        scores = np.asarray([item["similarity"] for item in semantic_elements], dtype=float)
-        interaction_weights = np.asarray(
-            [
-                1.0 if item.get("interactivity", False) else NON_INTERACTIVE_WEIGHT
-                for item in semantic_elements
-            ],
-            dtype=float,
-        )
-        relevance = float(
-            np.sum(interaction_weights * scores) / (np.sum(interaction_weights) + 1e-10)
-        )
-
-        coverage = 0.0
-        for element in elements:
-            box = element.get("bbox")
-            if isinstance(box, (list, tuple)) and len(box) == 4:
-                coverage += box_area(list(box))
-        logits = scores / SEMANTIC_TEMPERATURE
-        probabilities = np.exp(logits - np.max(logits))
-        probabilities /= np.sum(probabilities) + 1e-10
-        if len(probabilities) == 1:
-            concentration = 1.0
-        else:
-            entropy = -np.sum(probabilities * np.log(probabilities + 1e-10))
-            concentration = float(1.0 - entropy / np.log(len(probabilities) + 1e-10))
-
-        alpha, beta, gamma = REWARD_WEIGHTS
-        return alpha * relevance + beta * coverage + gamma * concentration
+        node.reward_components = self._reward_breakdown(elements, semantic_elements)
+        return node.reward_components.total
 
     @staticmethod
     def backpropagation(node: MCTSNode, reward: float) -> None:
@@ -299,6 +371,108 @@ class MCTSQuestionSample(BaseQuestionSample):
         self.backpropagation(node, reward)
         return reward
 
+    @staticmethod
+    def iter_tree_nodes(root: MCTSNode):
+        """Yield every node in depth-first order."""
+        pending = [root]
+        while pending:
+            node = pending.pop()
+            yield node
+            pending.extend(reversed(list(node.children.values())))
+
+    def collect_search_summary(self, best_node: MCTSNode) -> dict:
+        """Return compact search statistics suitable for benchmark output."""
+        nodes = list(self.iter_tree_nodes(self.root))
+        evaluated = [node for node in nodes if node.leaf_reward is not None]
+        rewards = [node.leaf_reward for node in evaluated]
+        action_distribution = {action: 0 for action in self.actions}
+        for node in nodes:
+            if node.action_from_parent in action_distribution:
+                action_distribution[node.action_from_parent] += 1
+
+        action_metrics = {}
+        for action in self.actions:
+            attempts = self.action_attempts[action]
+            successes = self.action_successes[action]
+            action_metrics[action] = {
+                "attempts": attempts,
+                "successes": successes,
+                "failures": attempts - successes,
+            }
+
+        return {
+            "simulation_budget": self.simulation_budget,
+            "depth_limit": self.max_depth,
+            "total_nodes": len(nodes),
+            "evaluated_nodes": len(evaluated),
+            "max_depth_reached": max((node.depth for node in nodes), default=0),
+            "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+            "max_reward": float(max(rewards)) if rewards else 0.0,
+            "best_action_path": best_node.action_path,
+            "action_distribution": action_distribution,
+            "action_metrics": action_metrics,
+        }
+
+    def serialize_search_tree(
+        self, node: MCTSNode, best_node: MCTSNode
+    ) -> dict:
+        """Serialize tree metadata without embedding crop image bytes."""
+        record = {
+            "depth": node.depth,
+            "action_from_parent": node.action_from_parent,
+            "action_history": node.action_path,
+            "region_coords": node.region,
+            "area_ratio": node.area_ratio,
+            "visits": node.visits,
+            "value": node.value,
+            "mean_value": node.mean_value,
+            "leaf_reward": node.leaf_reward,
+            "reward_components": (
+                node.reward_components.to_dict()
+                if node.reward_components is not None
+                else None
+            ),
+            "parsed_element_count": (
+                len(node.parsed_elements) if node.parsed_elements is not None else None
+            ),
+            "semantic_element_count": (
+                len(node.semantic_elements)
+                if node.semantic_elements is not None
+                else None
+            ),
+            "untried_actions": list(node.untried_actions),
+            "failed_actions": list(node.failed_actions),
+            "is_best": node is best_node,
+            "children": {},
+        }
+        record["children"] = {
+            action: self.serialize_search_tree(child, best_node)
+            for action, child in node.children.items()
+        }
+        return record
+
+    def format_search_tree(self, best_node: MCTSNode) -> str:
+        """Format a compact human-readable tree for debugging experiments."""
+        lines = []
+
+        def visit(node: MCTSNode, prefix: str, is_last: bool) -> None:
+            connector = "└── " if is_last else "├── "
+            action = node.action_from_parent or "root"
+            reward = "N/A" if node.leaf_reward is None else f"{node.leaf_reward:.3f}"
+            marker = " *" if node is best_node else ""
+            lines.append(
+                f"{prefix}{connector}{action} depth={node.depth} "
+                f"reward={reward} area={node.area_ratio:.3f} "
+                f"visits={node.visits}{marker}"
+            )
+            children = list(node.children.values())
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            for index, child in enumerate(children):
+                visit(child, child_prefix, index == len(children) - 1)
+
+        visit(self.root, "", True)
+        return "\n".join(lines)
+
     async def search(self) -> MCTSNode:
         initial_state = {
             "depth": 0,
@@ -312,12 +486,7 @@ class MCTSQuestionSample(BaseQuestionSample):
         for _ in range(self.simulation_budget):
             await self.single_run(initial_state)
 
-        nodes = []
-        pending = [self.root]
-        while pending:
-            node = pending.pop()
-            nodes.append(node)
-            pending.extend(node.children.values())
+        nodes = list(self.iter_tree_nodes(self.root))
         return max(
             (node for node in nodes if node.leaf_reward is not None),
             key=lambda node: node.leaf_reward,
@@ -349,7 +518,8 @@ class MCTSQuestionSample(BaseQuestionSample):
             best_node.area_ratio * 100,
             elapsed,
         )
-        return {
+        search_summary = self.collect_search_summary(best_node)
+        result = {
             "id": self.row["id"],
             "round_id": self.round_idx,
             "img_path": self.row["img_filename"],
@@ -370,6 +540,18 @@ class MCTSQuestionSample(BaseQuestionSample):
             "best_region": best_node.state["region_coords"],
             "best_region_reward": best_node.leaf_reward,
             "best_region_depth": best_node.state["depth"],
+            "reward_components": (
+                best_node.reward_components.to_dict()
+                if best_node.reward_components is not None
+                else None
+            ),
             "action_history": best_node.state["action_history"],
+            "search_summary": search_summary,
             "elapsed_seconds": elapsed,
         }
+        if self.include_search_tree:
+            result["search_tree"] = self.serialize_search_tree(
+                self.root, best_node
+            )
+            result["search_tree_text"] = self.format_search_tree(best_node)
+        return result
