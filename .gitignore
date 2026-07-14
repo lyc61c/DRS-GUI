@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
+
+# Local models and generated artifacts
+weights/
+checkpoints/
+data/
+downloads/
+outputs/
+crop_images*/
+*.log
+
+# The supplied PDF is a confidential review copy; keep it local.
+7995.pdf
