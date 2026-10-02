@@ -27,14 +27,9 @@ The implementation brings together three stages:
 | Search | MCTS action planner | Explore candidate regions through Focus, Shift, and Scatter |
 | Ground | Qwen2.5-VL or UGround-V1 | Predict the target point from the selected crop |
 
-```mermaid
-flowchart LR
-    A["Screenshot + instruction"] --> B["UI perception"]
-    B --> C["MCTS region search"]
-    C --> D["Best region"]
-    D --> E["Base grounding model"]
-    E --> F["Original-image click point"]
-```
+![DRS-GUI method overview](assets/drsgui_method.png)
+
+*Method overview (Figure 2 of the [DRS-GUI paper](https://arxiv.org/abs/2605.15542), CC BY 4.0).*
 
 ### Region-search actions
 
