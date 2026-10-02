@@ -3,6 +3,7 @@
 import copy
 import json
 import logging
+import math
 from pathlib import Path
 
 
@@ -10,11 +11,25 @@ LOGGER = logging.getLogger(__name__)
 GT_TYPES = ["positive"]
 INSTRUCTION_STYLES = ["instruction"]
 LANGUAGES = ["en"]
+BENCHMARK_FILES = {
+    "screenspot_v1": ("screenspot_desktop", "screenspot_mobile", "screenspot_web"),
+    "screenspot_v2": ("screenspot_desktop_v2", "screenspot_mobile_v2", "screenspot_web_v2"),
+}
 
 
 def normalize_task(task: dict, benchmark: str, task_filename: str, index: int) -> dict:
     """Normalize ScreenSpot v1, v2, and Pro records to one schema."""
     task = copy.deepcopy(task)
+    if not isinstance(task.get("instruction"), str) or not task["instruction"].strip():
+        raise ValueError(f"Missing instruction in {task_filename}.json record {index}")
+    if not isinstance(task.get("img_filename"), str) or not task["img_filename"]:
+        raise ValueError(f"Missing img_filename in {task_filename}.json record {index}")
+    bbox = task.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        raise ValueError(f"Expected a four-coordinate bbox in {task_filename}.json record {index}")
+    task["bbox"] = [float(value) for value in bbox]
+    if not all(math.isfinite(value) for value in task["bbox"]):
+        raise ValueError(f"Non-finite bbox in {task_filename}.json record {index}")
     task["id"] = task.get("id", f"{task_filename}_{index}")
     task["ui_type"] = task.get("ui_type", task.get("data_type", "unknown"))
     task["platform"] = task.get("platform", task.get("data_source", "unknown"))
@@ -32,6 +47,9 @@ def normalize_task(task: dict, benchmark: str, task_filename: str, index: int) -
         task["bbox"] = [x, y, x + width, y + height]
     elif bbox_format != "xyxy":
         raise ValueError(f"Unsupported bbox_format={bbox_format!r} in {task_filename}.json")
+    x1, y1, x2, y2 = task["bbox"]
+    if x2 < x1 or y2 < y1:
+        raise ValueError(f"Invalid bbox ordering in {task_filename}.json record {index}")
     return task
 
 
@@ -131,10 +149,17 @@ def _flatten_annotations(records: list[dict]) -> list[dict]:
 
 def get_tasks(args) -> tuple[dict | None, list[dict]]:
     annotation_dir = Path(args.screenspot_test)
+    if not annotation_dir.is_dir():
+        raise FileNotFoundError(f"Annotation directory not found: {annotation_dir}")
     if args.task == "all":
         filenames = sorted(path.stem for path in annotation_dir.glob("*.json"))
+        official = BENCHMARK_FILES.get(args.benchmark, ())
+        if any(filename in filenames for filename in official):
+            filenames = [filename for filename in official if filename in filenames]
     else:
-        filenames = args.task.split(",")
+        filenames = [filename.strip() for filename in args.task.split(",") if filename.strip()]
+    if not filenames:
+        raise FileNotFoundError(f"No annotation JSON files selected in {annotation_dir}")
 
     instruction_styles = _selected(args.inst_style, INSTRUCTION_STYLES)
     languages = _selected(args.language, LANGUAGES)
@@ -144,6 +169,8 @@ def get_tasks(args) -> tuple[dict | None, list[dict]]:
     for filename in filenames:
         path = annotation_dir / f"{filename}.json"
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list) or not all(isinstance(record, dict) for record in data):
+            raise ValueError(f"Expected a JSON array of annotation records in {path}")
         records = _flatten_annotations(data)
         for instruction_style in instruction_styles:
             for ground_truth_type in ground_truth_types:

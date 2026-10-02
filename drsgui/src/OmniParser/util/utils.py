@@ -2,12 +2,12 @@ import base64
 import io
 import logging
 import os
+from functools import lru_cache
 from typing import List, Tuple, Union
 
 import cv2
 import numpy as np
 from matplotlib import pyplot as plt
-from paddleocr import PaddleOCR
 from PIL import Image
 import supervision as sv
 import torch
@@ -19,22 +19,30 @@ from .box_annotator import BoxAnnotator
 
 
 LOGGER = logging.getLogger(__name__)
-paddle_ocr = PaddleOCR(
-    lang='en',
-    use_angle_cls=False,
-    use_gpu=False,
-    show_log=False,
-    max_batch_size=1024,
-    det_db_score_mode='slow',
-    rec_batch_num=1024)
 
 
-def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2-opt-2.7b", device=None):
+@lru_cache(maxsize=1)
+def get_ocr_engine():
+    """Initialize OCR on first use rather than when importing the CLI."""
+    from paddleocr import PaddleOCR
+
+    return PaddleOCR(
+        lang='en',
+        use_angle_cls=False,
+        use_gpu=False,
+        show_log=False,
+        max_batch_size=1024,
+        det_db_score_mode='slow',
+        rec_batch_num=1024,
+    )
+
+
+def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2-opt-2.7b", device=None, processor_name_or_path=None):
     if not device:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if model_name == "blip2":
         from transformers import Blip2Processor, Blip2ForConditionalGeneration
-        processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+        processor = Blip2Processor.from_pretrained(processor_name_or_path or model_name_or_path)
         if device == 'cpu':
             model = Blip2ForConditionalGeneration.from_pretrained(
             model_name_or_path, device_map=None, torch_dtype=torch.float32
@@ -46,15 +54,19 @@ def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2
     elif model_name == "florence2":
         from transformers import AutoModelForCausalLM, AutoProcessor
 
-        processor_path = model_name_or_path
+        processor_path = processor_name_or_path or model_name_or_path
         processor_loaded = False
 
         try:
-            if os.path.exists(processor_path) and os.path.isdir(processor_path):
-                processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True, local_files_only=True)
-                processor_loaded = True
-                LOGGER.info("Loaded Florence-2 processor from %s", processor_path)
+            processor = AutoProcessor.from_pretrained(
+                processor_path, trust_remote_code=True,
+                local_files_only=os.path.isdir(processor_path),
+            )
+            processor_loaded = True
+            LOGGER.info("Loaded Florence-2 processor from %s", processor_path)
         except Exception as e:
+            if processor_name_or_path:
+                raise RuntimeError(f"Unable to load the supplied caption processor: {processor_path}") from e
             LOGGER.warning("Could not load processor from %s: %s", processor_path, e)
 
         if not processor_loaded:
@@ -79,7 +91,9 @@ def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2
             model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
         else:
             model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True).to(device)
-    return {'model': model.to(device), 'processor': processor}
+    else:
+        raise ValueError(f"Unsupported caption model: {model_name}")
+    return {'model': model.to(device).eval(), 'processor': processor}
 
 
 def get_yolo_model(model_path):
@@ -90,11 +104,12 @@ def get_yolo_model(model_path):
 @torch.inference_mode()
 def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=None, batch_size=128):
     to_pil = ToPILImage()
-    if starting_idx:
-        non_ocr_boxes = filtered_boxes[starting_idx:]
-    else:
-        non_ocr_boxes = filtered_boxes
+    if starting_idx is not None and starting_idx < 0:
+        return []
+    non_ocr_boxes = filtered_boxes[starting_idx or 0:]
     croped_pil_image = []
+    crop_indices = []
+    generated_texts = [""] * len(non_ocr_boxes)
     for i, coord in enumerate(non_ocr_boxes):
         try:
             xmin, xmax = int(coord[0]*image_source.shape[1]), int(coord[2]*image_source.shape[1])
@@ -102,17 +117,22 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
             cropped_image = image_source[ymin:ymax, xmin:xmax, :]
             cropped_image = cv2.resize(cropped_image, (64, 64))
             croped_pil_image.append(to_pil(cropped_image))
-        except:
+            crop_indices.append(i)
+        except (cv2.error, ValueError):
             continue
 
+    if not croped_pil_image:
+        return generated_texts
+
     model, processor = caption_model_processor['model'], caption_model_processor['processor']
+    is_florence = 'florence' in str(getattr(model.config, 'model_type', '')).lower()
+    is_florence = is_florence or 'florence' in model.config.name_or_path.lower()
     if not prompt:
-        if 'florence' in model.config.name_or_path:
+        if is_florence:
             prompt = "<CAPTION>"
         else:
             prompt = "The image shows"
 
-    generated_texts = []
     device = model.device
     for i in range(0, len(croped_pil_image), batch_size):
         batch = croped_pil_image[i:i+batch_size]
@@ -120,13 +140,14 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
             inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt", do_resize=False).to(device=device, dtype=torch.float16)
         else:
             inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt").to(device=device)
-        if 'florence' in model.config.name_or_path:
+        if is_florence:
             generated_ids = model.generate(input_ids=inputs["input_ids"],pixel_values=inputs["pixel_values"],max_new_tokens=20,num_beams=1, do_sample=False)
         else:
             generated_ids = model.generate(**inputs, max_length=100, num_beams=5, no_repeat_ngram_size=2, early_stopping=True, num_return_sequences=1)
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)
         generated_text = [gen.strip() for gen in generated_text]
-        generated_texts.extend(generated_text)
+        for index, text in zip(crop_indices[i:i+batch_size], generated_text):
+            generated_texts[index] = text
 
     return generated_texts
 
@@ -298,7 +319,7 @@ def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
                     else:
                         filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': None, 'source':'box_yolo_content_yolo'})
             else:
-                filtered_boxes.append(box1)
+                filtered_boxes.append(dict(box1_elem))
     return filtered_boxes
 
 
@@ -396,7 +417,7 @@ def int_box_area(box, w, h):
     area = (int_box[2] - int_box[0]) * (int_box[3] - int_box[1])
     return area
 
-def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128):
+def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=None, use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, draw_bbox=True):
     """Process either an image path or Image object
 
     Args:
@@ -437,24 +458,16 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
 
     filtered_boxes = torch.tensor([box['bbox'] for box in filtered_boxes_elem])
 
-    if use_local_semantics:
+    if use_local_semantics and starting_idx >= 0:
         caption_model = caption_model_processor['model']
         if 'phi3_v' in caption_model.config.model_type:
-            parsed_content_icon = get_parsed_content_icon_phi3v(filtered_boxes, ocr_bbox, image_source, caption_model_processor)
+            parsed_content_icon = get_parsed_content_icon_phi3v(filtered_boxes[starting_idx:], [], image_source, caption_model_processor)
         else:
             parsed_content_icon = get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=prompt,batch_size=batch_size)
-        ocr_text = [f"Text Box ID {i}: {txt}" for i, txt in enumerate(ocr_text)]
-        icon_start = len(ocr_text)
-        parsed_content_icon_ls = []
-        for i, box in enumerate(filtered_boxes_elem):
-            if box['content'] is None:
-                box['content'] = parsed_content_icon.pop(0)
-        for i, txt in enumerate(parsed_content_icon):
-            parsed_content_icon_ls.append(f"Icon Box ID {str(i+icon_start)}: {txt}")
-        parsed_content_merged = ocr_text + parsed_content_icon_ls
-    else:
-        ocr_text = [f"Text Box ID {i}: {txt}" for i, txt in enumerate(ocr_text)]
-        parsed_content_merged = ocr_text
+        for box, caption in zip(filtered_boxes_elem[starting_idx:], parsed_content_icon):
+            box['content'] = caption
+    if not draw_bbox:
+        return None, {}, filtered_boxes_elem
     filtered_boxes = box_convert(boxes=filtered_boxes, in_fmt="xyxy", out_fmt="cxcywh")
 
     phrases = [i for i in range(len(filtered_boxes))]
@@ -503,9 +516,8 @@ def check_ocr_box(
         image_source = image_source.convert('RGB')
     image_np = np.array(image_source)
     w, h = image_source.size
-    result = paddle_ocr.ocr(image_np, cls=False)[0]
-    if result is None:
-        result = []
+    pages = get_ocr_engine().ocr(image_np, cls=False)
+    result = (pages[0] or []) if pages else []
     coord = [item[0] for item in result if item[1][1] > text_threshold]
     text = [item[1][0] for item in result if item[1][1] > text_threshold]
     if display_img:

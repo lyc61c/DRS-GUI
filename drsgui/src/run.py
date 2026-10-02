@@ -2,48 +2,37 @@
 
 import argparse
 import asyncio
-import json
 import logging
-import random
 from pathlib import Path
 
-import torch
-from PIL import Image
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
-
-from model_factory import build_model
-from OmniParser.util.utils import get_caption_model_processor, get_yolo_model
-from policies import policy_map
+from runtime import (
+    BENCHMARKS,
+    add_runtime_arguments,
+    configure_runtime,
+    initialize_models,
+    positive_int,
+)
 from screenspot_data import evaluate, get_tasks
-from utils import get_chunk
+from utils import get_chunk, save_json, valid_point
 
 
-BENCHMARKS = ("screenspot_v1", "screenspot_v2", "screenspot_pro")
-
-
-def parse_args():
+def parse_args(argv=None):
     project_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description="DRS-GUI evaluation")
     parser.add_argument("--benchmark", choices=BENCHMARKS, default="screenspot_pro")
-    parser.add_argument("--model-type", choices=["qwen2_5vl", "ugroundv1"], default="qwen2_5vl")
-    parser.add_argument("--model-path", required=True, help="Hugging Face model ID or local model path")
     parser.add_argument("--images", required=True, help="Root directory containing benchmark screenshots")
     parser.add_argument(
         "--annotations",
         required=True,
         help="Directory containing ScreenSpot-format JSON annotations",
     )
-    parser.add_argument("--detector-path", required=True, help="OmniParser icon detector model.pt")
-    parser.add_argument("--caption-model", required=True, help="Florence-2 caption model ID or local path")
-    parser.add_argument("--instructor-model", default="hkunlp/instructor-large")
-    parser.add_argument("--output", default=None)
     parser.add_argument("--task", default="all", help="Comma-separated annotation filenames without .json")
-    parser.add_argument("--num-chunks", type=int, default=1)
+    parser.add_argument("--num-chunks", type=positive_int, default=1)
     parser.add_argument("--chunk-idx", type=int, default=0)
-    parser.add_argument("--mcts-iterations", type=int, default=8)
-    parser.add_argument("--max-depth", type=int, default=3)
-    args = parser.parse_args()
+    add_runtime_arguments(parser)
+    args = parser.parse_args(argv)
+    if not 0 <= args.chunk_idx < args.num_chunks:
+        parser.error("--chunk-idx must satisfy 0 <= chunk-idx < num-chunks")
     if args.output is None:
         args.output = str(project_root / "outputs" / f"{args.model_type}_{args.benchmark}.json")
     return args
@@ -53,83 +42,84 @@ def attach_grounding_metrics(result, row):
     result["bbox"] = row.get("bbox")
     pred = result.get("pred")
     bbox = row.get("bbox")
-    width, height = row.get("img_size", [0, 0])
+    width, height = row["img_size"]
 
-    if pred and len(pred) == 2 and width and height:
-        result["pred_normalized"] = [pred[0] / width, pred[1] / height]
+    if valid_point(pred):
+        result["pred_normalized"] = [float(pred[0]) / width, float(pred[1]) / height]
     else:
         result["pred_normalized"] = None
 
-    if pred and bbox and len(pred) == 2 and len(bbox) == 4:
-        x, y = pred
-        result["correctness"] = "correct" if bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3] else "wrong"
+    if valid_point(pred) and bbox:
+        x, y = map(float, pred)
+        inside_box = bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
+        result["correctness"] = "correct" if inside_box else "wrong"
     else:
         result["correctness"] = "wrong_format"
     return result
 
 
-def initialize_models(args):
-    """Load the grounding model and the three DRS-GUI perception components."""
-    args.model = build_model(args.model_type, args.model_path)
-    args.som_model = get_yolo_model(args.detector_path).to("cuda")
-    args.caption_model = get_caption_model_processor(
-        model_name="florence2",
-        model_name_or_path=args.caption_model,
-        device="cuda",
-    )
-    args.semantic_model = SentenceTransformer(args.instructor_model)
-    return args
+def prepare_tasks(args):
+    """Validate dataset paths before allocating GPU memory."""
+    from PIL import Image
 
-
-async def evaluate_model(args):
+    args.screenspot_test = str(Path(args.annotations).expanduser())
+    args.inst_style = "instruction"
+    args.language = "en"
+    args.gt_type = "positive"
     _, tasks = get_tasks(args)
     tasks = get_chunk(tasks, args.num_chunks, args.chunk_idx)
-    results = []
-
-    for row in tqdm(tasks, desc="DRS-GUI"):
-        image_path = Path(args.images) / row["img_filename"]
+    if not tasks:
+        raise ValueError("No samples selected; check --task and the requested chunk")
+    image_root = Path(args.images).expanduser().resolve()
+    for row in tasks:
+        image_path = image_root / row["img_filename"]
         if not image_path.is_file():
             raise FileNotFoundError(f"Screenshot not found: {image_path}")
         row["img_filename"] = str(image_path)
         if not row.get("img_size"):
             with Image.open(image_path) as image:
                 row["img_size"] = [image.width, image.height]
-        sample = policy_map["drsgui.mcts"](row, args)
-        result = await sample.process()
+        size = row["img_size"]
+        if (
+            not isinstance(size, (list, tuple))
+            or not valid_point(size)
+            or any(float(value) <= 0 for value in size)
+        ):
+            raise ValueError(f"Invalid image size for {image_path}")
+        row["img_size"] = [float(value) for value in size]
+    return tasks
+
+
+async def evaluate_model(args, tasks):
+    from tqdm import tqdm
+
+    from policies import policy_map
+    from policies.drsgui.policy import result_metadata
+
+    results = []
+    for row in tqdm(tasks, desc="DRS-GUI"):
+        try:
+            sample = policy_map["drsgui.mcts"](row, args)
+            result = await sample.process()
+        except Exception as error:
+            logging.exception("Could not initialize sample %s", row["id"])
+            result = {**result_metadata(row), "pred": None, "error": str(error)}
         results.append(attach_grounding_metrics(result, row))
 
     report = evaluate(results)
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    output_path = save_json(report, args.output)
     logging.info("Saved %d predictions to %s", len(results), output_path)
+    return report
 
 
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    if not torch.cuda.is_available():
-        raise RuntimeError("DRS-GUI currently requires a CUDA-capable GPU")
-    random.seed(114514)
-    torch.manual_seed(114514)
-
-    annotation_path = Path(args.annotations)
-    if not annotation_path.is_dir() or not any(annotation_path.glob("*.json")):
-        raise FileNotFoundError(
-            f"No {args.benchmark} annotation JSON files found in {annotation_path}. "
-            "Download the official benchmark annotations and check --annotations."
-        )
-
-    args.screenspot_imgs = args.images
-    args.screenspot_test = args.annotations
-    args.inst_style = "instruction"
-    args.language = "en"
-    args.gt_type = "positive"
-    args.method_name = "drsgui.mcts"
-
+    tasks = prepare_tasks(args)
+    configure_runtime(args)
     initialize_models(args)
 
-    asyncio.run(evaluate_model(args))
+    asyncio.run(evaluate_model(args, tasks))
 
 
 if __name__ == "__main__":

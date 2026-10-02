@@ -6,8 +6,6 @@ import io
 import numpy as np
 from PIL import Image
 
-from OmniParser.util.utils import check_ocr_box, get_som_labeled_img
-
 
 def get_topk_semantic_matches(
     model,
@@ -25,7 +23,7 @@ def get_topk_semantic_matches(
         and isinstance(element.get("bbox"), (list, tuple))
         and len(element["bbox"]) == 4
     ]
-    if not elements:
+    if not elements or topk < 1:
         return []
 
     instruction_embedding = model.encode(
@@ -38,8 +36,9 @@ def get_topk_semantic_matches(
     )
     similarities = np.asarray(instruction_embedding) @ np.asarray(element_embeddings).T
     similarities = similarities[0]
+    similarities = np.nan_to_num(similarities, nan=0.0, posinf=0.0, neginf=0.0)
 
-    count = min(max(1, topk), len(elements))
+    count = min(topk, len(elements))
     indices = np.argsort(similarities)[-count:][::-1]
     ranked = []
     for index in indices:
@@ -54,12 +53,13 @@ def analyze_ui_image_simple(
     som_model,
     caption_model_processor,
     box_threshold: float = 0.05,
-    draw_bbox_scale: int = 3200,
     iou_threshold: float = 0.7,
     batch_size: int = 128,
     ocr_text_threshold: float = 0.9,
 ) -> tuple:
     """Parse a base64 screenshot into OmniParser UI elements."""
+    from OmniParser.util.utils import check_ocr_box, get_som_labeled_img
+
     image = Image.open(io.BytesIO(base64.b64decode(image_base64))).convert("RGB")
     ocr_result, _ = check_ocr_box(
         image,
@@ -70,25 +70,18 @@ def analyze_ui_image_simple(
     )
     ocr_text, ocr_boxes = ocr_result
 
-    overlay_ratio = max(image.size) / draw_bbox_scale
-    draw_config = {
-        "text_scale": 0.8 * overlay_ratio,
-        "text_thickness": max(int(2 * overlay_ratio), 1),
-        "text_padding": max(int(3 * overlay_ratio), 1),
-        "thickness": max(int(3 * overlay_ratio), 1),
-    }
     result = get_som_labeled_img(
         image,
         som_model,
         BOX_TRESHOLD=box_threshold,
         output_coord_in_ratio=True,
         ocr_bbox=ocr_boxes,
-        draw_bbox_config=draw_config,
         caption_model_processor=caption_model_processor,
         ocr_text=ocr_text,
         use_local_semantics=True,
         iou_threshold=iou_threshold,
         scale_img=False,
         batch_size=batch_size,
+        draw_bbox=False,
     )
     return result if result is not None else (None, [], [])

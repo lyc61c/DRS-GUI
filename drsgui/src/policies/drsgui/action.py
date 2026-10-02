@@ -44,10 +44,10 @@ def clamp_box(box: Box, width: int, height: int) -> Box:
     x1, x2 = sorted((x1, x2))
     y1, y2 = sorted((y1, y2))
     return [
-        max(0.0, x1),
-        max(0.0, y1),
-        min(float(width), x2),
-        min(float(height), y2),
+        min(float(width), max(0.0, x1)),
+        min(float(height), max(0.0, y1)),
+        min(float(width), max(0.0, x2)),
+        min(float(height), max(0.0, y2)),
     ]
 
 

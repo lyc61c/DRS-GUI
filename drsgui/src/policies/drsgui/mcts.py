@@ -12,9 +12,11 @@ import numpy as np
 from PIL import Image
 
 from ui_perceptor import analyze_ui_image_simple, get_topk_semantic_matches
-from .action import action_focus, action_scatter, action_shift, box_area
+from utils import valid_point
+from .action import action_focus, action_scatter, action_shift, box_area, clamp_box
 from .instruction_config import select_instruction
 from .policy import QuestionSample as BaseQuestionSample
+from .policy import result_metadata
 
 
 LOGGER = logging.getLogger(__name__)
@@ -92,6 +94,8 @@ class MCTSQuestionSample(BaseQuestionSample):
         self.max_depth = args.max_depth
         self.exploration_constant = 1.0
         self.simulation_budget = args.mcts_iterations
+        if self.max_depth < 1 or self.simulation_budget < 1:
+            raise ValueError("Search depth and simulation budget must be positive")
         self.actions = ["focus", "scatter", "shift"]
         self.action_executors = {
             "focus": self.execute_focus_action,
@@ -132,7 +136,10 @@ class MCTSQuestionSample(BaseQuestionSample):
         local_region: list[float],
         action: str,
     ) -> MCTSNode | None:
-        x1, y1, x2, y2 = map(int, local_region)
+        if local_region is None:
+            return None
+        bounded_region = clamp_box(local_region, node_image.width, node_image.height)
+        x1, y1, x2, y2 = map(int, bounded_region)
         if x2 <= x1 or y2 <= y1:
             return None
         if box_area([x1, y1, x2, y2]) >= 0.999 * node_image.width * node_image.height:
@@ -157,7 +164,8 @@ class MCTSQuestionSample(BaseQuestionSample):
     ) -> MCTSNode | None:
         if global_region is None:
             return None
-        x1, y1, x2, y2 = map(int, global_region)
+        bounded_region = clamp_box(global_region, original_image.width, original_image.height)
+        x1, y1, x2, y2 = map(int, bounded_region)
         if x2 <= x1 or y2 <= y1:
             return None
         if [x1, y1, x2, y2] == [int(value) for value in node.state["region_coords"]]:
@@ -335,6 +343,9 @@ class MCTSQuestionSample(BaseQuestionSample):
 
     async def simulation(self, node: MCTSNode) -> float:
         """Compute the three-term region quality reward from the paper."""
+        # A node's image and instruction are fixed, so its reward is reusable.
+        if node.reward_components is not None:
+            return node.reward_components.total
         elements = await self._parse_node(node)
         semantic_elements = get_topk_semantic_matches(
             self.semantic_model,
@@ -500,7 +511,7 @@ class MCTSQuestionSample(BaseQuestionSample):
         )
 
         point = final_answer.get("point") if isinstance(final_answer, dict) else None
-        if isinstance(point, (list, tuple)) and len(point) == 2:
+        if valid_point(point, normalized=True):
             x1, y1, x2, y2 = best_node.state["region_coords"]
             prediction = [
                 x1 + float(point[0]) * (x2 - x1),
@@ -520,18 +531,7 @@ class MCTSQuestionSample(BaseQuestionSample):
         )
         search_summary = self.collect_search_summary(best_node)
         result = {
-            "id": self.row["id"],
-            "round_id": self.round_idx,
-            "img_path": self.row["img_filename"],
-            "group": self.row.get("group"),
-            "platform": self.row["platform"],
-            "application": self.row["application"],
-            "lang": self.row["language"],
-            "instruction_style": self.row["instruction_style"],
-            "prompt_to_evaluate": self.row["prompt_to_evaluate"],
-            "gt_type": self.row["gt_type"],
-            "ui_type": self.row["ui_type"],
-            "task_filename": self.row["task_filename"],
+            **result_metadata(self.row, self.round_idx),
             "pred": prediction,
             "raw_response": final_answer.get("raw_response", "")
             if isinstance(final_answer, dict)

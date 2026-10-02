@@ -4,34 +4,29 @@ import argparse
 import asyncio
 import json
 import logging
-import random
 from pathlib import Path
 
-import torch
-from PIL import Image
-
-from policies import policy_map
-from run import initialize_models
+from runtime import add_runtime_arguments, configure_runtime, initialize_models
+from utils import save_json
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="DRS-GUI single-image inference")
     parser.add_argument("--image", required=True, help="Path to one GUI screenshot")
     parser.add_argument("--instruction", required=True, help="Element to locate")
-    parser.add_argument("--model-type", choices=["qwen2_5vl", "ugroundv1"], default="qwen2_5vl")
-    parser.add_argument("--model-path", required=True, help="Hugging Face model ID or local path")
-    parser.add_argument("--detector-path", required=True, help="OmniParser icon detector model.pt")
-    parser.add_argument("--caption-model", required=True, help="OmniParser Florence-2 model path")
-    parser.add_argument("--instructor-model", default="hkunlp/instructor-large")
     parser.add_argument("--platform", default="unknown", help="For example: windows, macos, web")
     parser.add_argument("--application", default="unknown", help="For example: vscode, excel")
-    parser.add_argument("--mcts-iterations", type=int, default=8)
-    parser.add_argument("--max-depth", type=int, default=3)
-    parser.add_argument("--output", default=None, help="Optional JSON output path")
-    return parser.parse_args()
+    add_runtime_arguments(parser)
+    args = parser.parse_args(argv)
+    if not args.instruction.strip():
+        parser.error("--instruction must not be empty")
+    return args
 
 
-async def infer(args):
+def prepare_sample(args):
+    """Read the input before loading the GPU models."""
+    from PIL import Image
+
     image_path = Path(args.image).expanduser().resolve()
     if not image_path.is_file():
         raise FileNotFoundError(f"Screenshot not found: {image_path}")
@@ -39,7 +34,7 @@ async def infer(args):
     with Image.open(image_path) as image:
         image_size = [image.width, image.height]
 
-    row = {
+    return {
         "id": image_path.stem,
         "img_filename": str(image_path),
         "img_size": image_size,
@@ -54,26 +49,31 @@ async def infer(args):
         "ui_type": "unknown",
         "task_filename": "single_image",
     }
+
+
+async def infer(args, row=None):
+    from policies import policy_map
+
+    row = prepare_sample(args) if row is None else row
     sample = policy_map["drsgui.mcts"](row, args)
     result = await sample.process()
 
     if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        output_path = save_json(result, args.output)
         logging.info("Saved prediction to %s", output_path)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
+    return result
 
 
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    if not torch.cuda.is_available():
-        raise RuntimeError("DRS-GUI currently requires a CUDA-capable GPU")
-    random.seed(114514)
-    torch.manual_seed(114514)
+    row = prepare_sample(args)
+    configure_runtime(args)
     initialize_models(args)
-    asyncio.run(infer(args))
+    result = asyncio.run(infer(args, row))
+    if result.get("error"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

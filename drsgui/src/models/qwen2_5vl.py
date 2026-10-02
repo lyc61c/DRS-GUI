@@ -1,14 +1,13 @@
 import base64
 import json
-import os
 from io import BytesIO
 
 import torch
-from PIL import Image
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from transformers.generation import GenerationConfig
 
 from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import smart_resize
+from utils import load_rgb_image, valid_point
 
 
 def convert_pil_image_to_base64(image):
@@ -85,12 +84,9 @@ class Qwen2_5VLModel:
         self.generation_config.update(**kwargs)
         self.model.generation_config = GenerationConfig(**self.generation_config)
 
+    @torch.inference_mode()
     def ground_only_positive(self, instruction, image):
-        if isinstance(image, str):
-            image_path = image
-            assert os.path.exists(image_path) and os.path.isfile(image_path), "Invalid input image path."
-            image = Image.open(image_path).convert('RGB')
-        assert isinstance(image, Image.Image), "Invalid input image."
+        image = load_rgb_image(image)
 
         resized_height, resized_width = smart_resize(
             image.height,
@@ -148,7 +144,9 @@ class Qwen2_5VLModel:
                 point_y = (y1 + y2) / 2
             else:
                 raise ValueError("Wrong output format")
-            result_dict["point"] = [point_x / resized_width, point_y / resized_height]
+            point = [point_x / resized_width, point_y / resized_height]
+            if valid_point(point, normalized=True):
+                result_dict["point"] = point
         except (IndexError, KeyError, TypeError, ValueError):
             pass
 
