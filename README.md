@@ -2,7 +2,7 @@
 
 # DRS-GUI
 
-### Training-free Region Search for GUI Grounding
+### Dynamic Region Search for Training-Free GUI Grounding
 
 Find a useful region first. Ground the target within that region.
 
