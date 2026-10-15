@@ -87,8 +87,8 @@ class MCTSNode:
 class MCTSQuestionSample(BaseQuestionSample):
     """Run dynamic region search for one grounding sample."""
 
-    def __init__(self, row, args, round_idx=0):
-        super().__init__(row, args, round_idx)
+    def __init__(self, row, args):
+        super().__init__(row, args)
         image = Image.open(io.BytesIO(base64.b64decode(self.image)))
         self.image_width, self.image_height = image.size
         self.max_depth = args.max_depth
@@ -392,7 +392,7 @@ class MCTSQuestionSample(BaseQuestionSample):
             pending.extend(reversed(list(node.children.values())))
 
     def collect_search_summary(self, best_node: MCTSNode) -> dict:
-        """Return compact search statistics suitable for benchmark output."""
+        """Return compact statistics for the single-image region search."""
         nodes = list(self.iter_tree_nodes(self.root))
         evaluated = [node for node in nodes if node.leaf_reward is not None]
         rewards = [node.leaf_reward for node in evaluated]
@@ -489,7 +489,7 @@ class MCTSQuestionSample(BaseQuestionSample):
             "depth": 0,
             "image": self.image,
             "action_history": [],
-            "text": self.row["prompt_to_evaluate"],
+            "text": self.row["instruction"],
             "image_width": self.image_width,
             "image_height": self.image_height,
             "region_coords": [0, 0, self.image_width, self.image_height],
@@ -507,7 +507,7 @@ class MCTSQuestionSample(BaseQuestionSample):
         start_time = time.time()
         best_node = await self.search()
         final_answer = await self.generate(
-            self.row["prompt_to_evaluate"], best_node.state["image"]
+            self.row["instruction"], best_node.state["image"]
         )
 
         point = final_answer.get("point") if isinstance(final_answer, dict) else None
@@ -531,7 +531,7 @@ class MCTSQuestionSample(BaseQuestionSample):
         )
         search_summary = self.collect_search_summary(best_node)
         result = {
-            **result_metadata(self.row, self.round_idx),
+            **result_metadata(self.row),
             "pred": prediction,
             "raw_response": final_answer.get("raw_response", "")
             if isinstance(final_answer, dict)

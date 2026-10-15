@@ -1,4 +1,4 @@
-"""Shared command-line options and model setup for inference and evaluation."""
+"""Command-line options and model setup for single-image search and grounding."""
 
 import argparse
 import logging
@@ -6,7 +6,6 @@ import random
 from pathlib import Path
 
 
-BENCHMARKS = ("screenspot_v1", "screenspot_v2", "screenspot_pro")
 MODEL_TYPES = ("qwen2_5vl", "ugroundv1")
 
 
@@ -18,7 +17,7 @@ def positive_int(value):
 
 
 def add_runtime_arguments(parser):
-    """Keep both entry points on the same model and search configuration."""
+    """Configure the grounding backend, perception models, and region search."""
     models = parser.add_argument_group("models")
     models.add_argument("--model-type", choices=MODEL_TYPES, default="qwen2_5vl")
     models.add_argument("--model-path", required=True, help="Hugging Face model ID or local path")

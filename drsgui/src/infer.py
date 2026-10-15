@@ -39,15 +39,8 @@ def prepare_sample(args):
         "img_filename": str(image_path),
         "img_size": image_size,
         "instruction": args.instruction,
-        "prompt_to_evaluate": args.instruction,
         "platform": args.platform,
         "application": args.application,
-        "group": None,
-        "language": "en",
-        "instruction_style": "instruction",
-        "gt_type": "positive",
-        "ui_type": "unknown",
-        "task_filename": "single_image",
     }
 
 

@@ -11,7 +11,7 @@ Find a useful region first. Ground the target within that region.
 ![Grounding models](https://img.shields.io/badge/Grounding-Qwen2.5--VL%20%7C%20UGround-blue)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green)](LICENSE.txt)
 
-[Overview](#overview) · [Setup](#setup) · [Models](#models) · [Datasets](#datasets) · [Inference](#single-image-inference) · [Evaluation](#benchmark-evaluation) · [Code](#code-organization)
+[Overview](#overview) · [Setup](#setup) · [Models](#models) · [Inference](#single-image-inference) · [Outputs](#outputs-and-search-inspection) · [Code](#code-organization)
 
 </div>
 
@@ -41,12 +41,11 @@ The implementation brings together three stages:
 
 The search evaluates regions using relevance, coverage, and concentration. By default it uses **8 simulations** and a **maximum depth of 3**. MCTS does not call the base grounding model during search; coordinate prediction happens after region selection.
 
-### Supported workflows
+### Features
 
 - Single-image grounding from a screenshot and a natural-language instruction.
-- Benchmark evaluation on **ScreenSpot v1**, **ScreenSpot v2**, and **ScreenSpot-Pro**.
 - Interchangeable Qwen2.5-VL and UGround-V1 grounding adapters.
-- Per-sample predictions, grouped accuracy metrics, and optional search-tree inspection.
+- Original-image click coordinates, selected regions, and optional search-tree inspection.
 
 ## Setup
 
@@ -71,11 +70,10 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 
 The CUDA check should print `True`. The dependency versions in `requirements.txt` are based on the project's `gui` environment.
 
-You can inspect either entry point without loading models:
+You can inspect the single-image entry point without loading models:
 
 ```bash
 python drsgui/src/infer.py --help
-python drsgui/src/run.py --help
 ```
 
 ## Models
@@ -120,9 +118,9 @@ hf download osunlp/UGround-V1-7B \
 
 OmniParser's caption directory contains the caption weights; Florence-2-base supplies the processor. Use `--caption-processor` for an explicit local processor path. If omitted, the loader tries the caption directory and then the Florence-2-base cache/Hub. PaddleOCR initializes on the first parsing call and may download its OCR weights.
 
-### Shared model arguments
+### Model arguments
 
-The inference and evaluation examples below reuse this Bash array. Define it once in the same terminal session:
+The single-image command below uses this Bash array. Define it once in the same terminal session:
 
 ```bash
 MODEL_ARGS=(
@@ -142,65 +140,9 @@ To switch to UGround-V1, replace the first two entries with:
 --model-path checkpoints/UGround-V1-7B
 ```
 
-## Datasets
-
-Screenshots and annotations are downloaded separately from the code. This repository does **not** bundle benchmark data.
-
-| Benchmark | Download | `--images` | `--annotations` |
-| :--- | :--- | :--- | :--- |
-| ScreenSpot v1 | [SeeClick release](https://github.com/njucckevin/SeeClick#gui-grounding-benchmark-screenspot) / [HF mirror](https://huggingface.co/datasets/benwiesel/ScreenSpot) | `data/screenspot_v1/images` | `data/screenspot_v1/annotations` |
-| ScreenSpot v2 | [Official release](https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2) | `data/screenspot_v2/screenspotv2_image` | `data/screenspot_v2` |
-| ScreenSpot-Pro | [Official release](https://huggingface.co/datasets/likaixin/ScreenSpot-Pro) | `data/screenspot_pro/images` | `data/screenspot_pro/annotations` |
-
-<details>
-<summary><b>Download commands and annotation filenames</b></summary>
-
-```bash
-hf download benwiesel/ScreenSpot --repo-type dataset \
-  --local-dir data/screenspot_v1
-
-hf download OS-Copilot/ScreenSpot-v2 --repo-type dataset \
-  --local-dir data/screenspot_v2
-unzip data/screenspot_v2/screenspotv2_image.zip -d data/screenspot_v2
-
-hf download likaixin/ScreenSpot-Pro --repo-type dataset \
-  --local-dir data/screenspot_pro
-```
-
-ScreenSpot v1 uses `screenspot_desktop.json`, `screenspot_mobile.json`, and `screenspot_web.json`. V2 uses `screenspot_desktop_v2.json`, `screenspot_mobile_v2.json`, and `screenspot_web_v2.json`. Pro has application-specific JSON files in its `annotations/` directory.
-
-The v1 command uses a community mirror. You can instead download the original images and annotations from the SeeClick release and arrange them under the paths in the table.
-
-</details>
-
-`--images` must be the root relative to which each annotation's `img_filename` resolves. The loader supports flat target records and image-level records containing an `annotations` list. V1/v2 boxes are interpreted as `[x, y, width, height]`; Pro boxes as `[x1, y1, x2, y2]`.
-
-<details>
-<summary><b>Use custom ScreenSpot-format annotations</b></summary>
-
-Store a JSON array in your annotation directory. For example:
-
-```json
-[
-  {
-    "img_filename": "screenshot.png",
-    "instruction": "Click the Settings button",
-    "bbox": [100, 50, 160, 90],
-    "bbox_format": "xyxy",
-    "data_type": "icon",
-    "platform": "windows",
-    "application": "unknown"
-  }
-]
-```
-
-The bounding box is in original-image pixels. Specify `"bbox_format": "xyxy"` when v1/v2 records have already been converted. Select a custom filename with `--task filename_without_json`. Optional metadata is filled with defaults; missing instructions, images, or malformed boxes are reported before model loading.
-
-</details>
-
 ## Single-image inference
 
-After defining `MODEL_ARGS`, provide your own screenshot and instruction:
+Only one screenshot and a natural-language instruction are required; no dataset or annotation files are needed. After defining `MODEL_ARGS`, run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python drsgui/src/infer.py \
@@ -216,40 +158,6 @@ CUDA_VISIBLE_DEVICES=0 python drsgui/src/infer.py \
 
 The `pred` field is the click point in **original-screenshot pixels**, not crop-relative coordinates. This entry point predicts a location; it does not execute a mouse click.
 
-## Benchmark evaluation
-
-The same pipeline—perception, region search, and final grounding—runs for every benchmark sample.
-
-```bash
-# ScreenSpot-Pro
-CUDA_VISIBLE_DEVICES=0 bash drsgui/scripts/run_screenspot_pro.sh \
-  "${MODEL_ARGS[@]}" \
-  --images data/screenspot_pro/images \
-  --annotations data/screenspot_pro/annotations \
-  --output outputs/qwen2_5vl_screenspot_pro.json
-```
-
-<details>
-<summary><b>ScreenSpot v1 and v2</b></summary>
-
-```bash
-CUDA_VISIBLE_DEVICES=0 bash drsgui/scripts/run_screenspot_v1.sh \
-  "${MODEL_ARGS[@]}" \
-  --images data/screenspot_v1/images \
-  --annotations data/screenspot_v1/annotations \
-  --output outputs/qwen2_5vl_screenspot_v1.json
-
-CUDA_VISIBLE_DEVICES=0 bash drsgui/scripts/run_screenspot_v2.sh \
-  "${MODEL_ARGS[@]}" \
-  --images data/screenspot_v2/screenspotv2_image \
-  --annotations data/screenspot_v2 \
-  --output outputs/qwen2_5vl_screenspot_v2.json
-```
-
-</details>
-
-You can also call `python drsgui/src/run.py --benchmark screenspot_v2 ...` directly. With `--task all`, v1/v2 select their recognized split files when present, avoiding duplicate combined annotations. Pro uses all annotation JSON files in the supplied directory.
-
 ### Useful options
 
 | Option | Default | Use |
@@ -258,33 +166,22 @@ You can also call `python drsgui/src/run.py --benchmark screenspot_v2 ...` direc
 | `--max-depth` | `3` | Maximum action-search depth |
 | `--seed` | `114514` | Random seed for the runtime |
 | `--include-search-tree` | Off | Save structured and readable search trees |
-| `--task` | `all` | Evaluation only: one or more comma-separated JSON stems |
-| `--num-chunks` / `--chunk-idx` | `1` / `0` | Evaluation only: split the selected samples into independent runs |
-
-For example, append `--task screenspot_web_v2` to the v2 command to select only web samples. To distribute evaluation across GPUs, launch separate processes with different `CUDA_VISIBLE_DEVICES`, chunk indices, and output paths:
-
-```text
-GPU 0: --num-chunks 2 --chunk-idx 0 --output outputs/part_0.json
-GPU 1: --num-chunks 2 --chunk-idx 1 --output outputs/part_1.json
-```
-
-These are independent runs, not distributed model training. Combine their `details` lists and recompute metrics with `screenspot_data.evaluate`; do not average chunk accuracies when chunk sizes differ.
 
 ## Outputs and search inspection
 
-Evaluation writes a JSON report containing:
+Inference prints one JSON object and optionally writes it to `--output`:
 
 | Field | Content |
 | :--- | :--- |
-| `details` | Per-sample predictions, original-image regions, model responses, search summaries, and elapsed time |
-| `metrics.overall` | Overall, text, and icon accuracy; sample counts; malformed predictions |
-| `metrics.fine_grained` | Platform/application-level metric groups |
-| `metrics.leaderboard_simple_style` | Group-level metrics |
-| `metrics.leaderboard_detailed_style` | Application-level metrics |
+| `id`, `img_path`, `img_size`, `instruction` | Input screenshot identity, dimensions, and instruction |
+| `pred` | Predicted `[x, y]` click point in original-image pixels, or `null` if unavailable |
+| `best_region` | Selected `[x1, y1, x2, y2]` region in original-image pixels |
+| `action_history` | Focus / Shift / Scatter actions leading to the selected region |
+| `reward_components`, `search_summary` | Region-quality terms and search statistics |
+| `raw_response`, `full_response` | Grounding-model response |
+| `elapsed_seconds` | Time spent on region search and final grounding, excluding model initialization |
 
-A prediction is correct when its point lies inside the annotated target box. Failed samples remain in the metric denominator and retain their grouping metadata.
-
-Each successful sample includes `pred`, `best_region`, `action_history`, `reward_components`, and `search_summary`. The following is an **illustrative subset**, not a benchmark result:
+Each successful sample includes `pred`, `best_region`, `action_history`, `reward_components`, and `search_summary`. The following is an **illustrative subset** of the output:
 
 ```json
 {
@@ -295,7 +192,7 @@ Each successful sample includes `pred`, `best_region`, `action_history`, `reward
 }
 ```
 
-Append `--include-search-tree` to either entry point to also save `search_tree` and `search_tree_text`. Tree records contain actions, regions, rewards, and visits; they omit embedded screenshot bytes.
+Append `--include-search-tree` to the inference command to also save `search_tree` and `search_tree_text`. Tree records contain actions, regions, rewards, and visits; they omit embedded screenshot bytes. If processing raises an exception, the output contains `pred: null`, `error`, and `traceback`, and the command exits with a nonzero status.
 
 ## Code organization
 
@@ -304,32 +201,30 @@ DRS-GUI/
 ├── README.md
 ├── requirements.txt
 ├── LICENSE.txt
+├── assets/
+│   └── drsgui_method.png             # method overview from the paper
 ├── drsgui/
-│   ├── scripts/                      # v1 / v2 / Pro launchers
 │   └── src/
-│       ├── infer.py                  # single-image CLI
-│       ├── run.py                    # evaluation CLI and result collection
-│       ├── runtime.py                # shared options, seeds, model initialization
+│       ├── infer.py                  # single-image search and grounding CLI
+│       ├── runtime.py                # options, seeds, model initialization
 │       ├── model_factory.py          # grounding-model selection
-│       ├── screenspot_data.py        # annotation loading and grouped metrics
 │       ├── ui_perceptor.py           # UI parsing and semantic ranking
-│       ├── utils.py                  # image, coordinate, chunk, JSON helpers
+│       ├── utils.py                  # image, coordinate, JSON helpers
 │       ├── models/                   # Qwen2.5-VL / UGround-V1 adapters
 │       ├── policies/drsgui/
 │       │   ├── mcts.py               # search, rewards, backpropagation, diagnostics
 │       │   ├── action.py             # Focus / Shift / Scatter geometry
 │       │   ├── instruction_config.py # domain-specific semantic prefixes
-│       │   └── policy.py             # shared sample and result interface
+│       │   └── policy.py             # grounding sample and result interface
 │       └── OmniParser/               # retained perception utilities and license
 ├── checkpoints/                      # local models; not tracked
-├── data/                             # local benchmarks; not tracked
-└── outputs/                          # generated reports; not tracked
+└── outputs/                          # generated predictions; not tracked
 ```
 
-For extending the project, start with `model_factory.py` and `models/` for a new grounding backend, `screenspot_data.py` for a new annotation schema, or `policies/drsgui/` for search behavior. Grounding adapters return a normalized crop-relative `point`; the planner handles original-image coordinate mapping.
+For extending the project, start with `model_factory.py` and `models/` for a new grounding backend, or `policies/drsgui/` for search behavior. Grounding adapters return a normalized crop-relative `point`; the planner handles original-image coordinate mapping.
 
 ## Acknowledgements and license
 
-DRS-GUI builds on [OmniParser](https://github.com/microsoft/OmniParser), [INSTRUCTOR](https://github.com/xlang-ai/instructor-embedding), [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL), and [UGround](https://github.com/OSU-NLP-Group/UGround). We thank the ScreenSpot and ScreenSpot-Pro contributors for their benchmarks.
+DRS-GUI builds on [OmniParser](https://github.com/microsoft/OmniParser), [INSTRUCTOR](https://github.com/xlang-ai/instructor-embedding), [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL), and [UGround](https://github.com/OSU-NLP-Group/UGround).
 
-Project code is released under [Apache 2.0](LICENSE.txt). The retained OmniParser utilities carry their [separate license](drsgui/src/OmniParser/LICENSE). Downloaded model weights and datasets remain governed by their upstream licenses.
+Project code is released under [Apache 2.0](LICENSE.txt). The retained OmniParser utilities carry their [separate license](drsgui/src/OmniParser/LICENSE). Downloaded model weights remain governed by their upstream licenses.

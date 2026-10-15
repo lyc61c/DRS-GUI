@@ -5,16 +5,6 @@ import math
 from pathlib import Path
 
 
-def get_chunk(items, number_of_chunks, chunk_index):
-    if number_of_chunks < 1:
-        raise ValueError("number_of_chunks must be positive")
-    if not 0 <= chunk_index < number_of_chunks:
-        raise ValueError("chunk_index must satisfy 0 <= chunk_index < number_of_chunks")
-    chunk_size = max(1, math.ceil(len(items) / number_of_chunks))
-    start = chunk_index * chunk_size
-    return items[start : start + chunk_size]
-
-
 def valid_point(point, normalized=False):
     """Reject malformed, non-finite, and out-of-range model coordinates."""
     if not isinstance(point, (list, tuple)) or len(point) != 2:

@@ -1,4 +1,4 @@
-"""Grounding-model construction for the models evaluated in DRS-GUI."""
+"""Grounding-model construction for single-image DRS-GUI inference."""
 
 
 def build_model(model_type, model_name_or_path):
